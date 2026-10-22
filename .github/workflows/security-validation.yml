@@ -1,0 +1,129 @@
+name: Security dependency validation
+
+on:
+  push:
+    branches: [main, security/dependencies-20261022]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'Ifeoluwakolopin/customer-management-app'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PIP_NO_CACHE_DIR: '1'
+      SECRET_KEY: isolated-hosted-validation-only-not-a-deployment-secret
+      EMAIL_HOST_PASSWORD: unused-no-smtp
+      DATABASE_URL: sqlite:///ci.sqlite3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13.17'
+      - name: Install coherent supported dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip check
+      - name: Framework, schema and static files
+        run: |
+          python manage.py check
+          python manage.py makemigrations --check --dry-run
+          python manage.py migrate --noinput
+          python manage.py collectstatic --noinput
+      - name: Isolated route, authentication, CRM and image smoke
+        run: |
+          python - <<'PY'
+          import io
+          import os
+          os.environ["DJANGO_SETTINGS_MODULE"] = "crm.settings"
+          import django
+          django.setup()
+          from django.conf import settings
+          assert settings.DATABASES["default"]["ENGINE"] == "django.db.backends.sqlite3"
+          assert str(settings.DATABASES["default"]["NAME"]).endswith("ci.sqlite3")
+          from django.test import Client, override_settings
+          from django.contrib.auth.models import Group, User
+          from django.core import mail
+          from django.core.files.uploadedfile import SimpleUploadedFile
+          from django.urls import reverse
+          from accounts.models import Customer, Order, Product, Tag
+          from accounts.filters import OrderFilter
+          import crm.asgi
+          import crm.wsgi
+          import psycopg2
+          from PIL import Image
+          Group.objects.get_or_create(name="customer")
+          admin_group, _ = Group.objects.get_or_create(name="admin")
+          password = "Isolated-CI-Auth-4387!"
+          with override_settings(ALLOWED_HOSTS=["testserver"], EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend"):
+              client = Client()
+              for name in ("login", "register", "reset_password"):
+                  assert client.get(reverse(name)).status_code == 200, name
+              assert client.get(reverse("home")).status_code == 302
+              registered = client.post(reverse("register"), {
+                  "username": "smoke", "email": "smoke@example.invalid",
+                  "password1": password, "password2": password,
+              })
+              assert registered.status_code == 302, registered.content
+              user = User.objects.get(username="smoke")
+              assert Customer.objects.filter(user=user).exists()
+              assert user.groups.filter(name="customer").exists()
+              assert client.post(reverse("login"), {"username": user.username, "password": password}).status_code == 302
+              for name in ("user-page", "account"):
+                  assert client.get(reverse(name)).status_code == 200, name
+              assert client.get(reverse("home")).url == reverse("user-page")
+              denied = client.get(reverse("products"))
+              assert b"You are not authorized" in denied.content
+              image = io.BytesIO()
+              Image.new("RGB", (4, 4), "blue").save(image, format="PNG")
+              customer = user.customer
+              response = client.post(reverse("account"), {
+                  "name": "Smoke Customer", "email": user.email, "phone": "1234567",
+                  "profile_pic": SimpleUploadedFile("ci-profile.png", image.getvalue(), content_type="image/png"),
+              })
+              assert response.status_code == 200
+              customer.refresh_from_db()
+              assert customer.name == "Smoke Customer"
+              assert customer.profile_pic.name.endswith(".png")
+              assert client.get(reverse("logout")).status_code == 302
+              assert client.post(reverse("reset_password"), {"email": user.email}).status_code == 302
+              assert len(mail.outbox) == 1
+              admin = User.objects.create_user(username="admin-smoke", email="admin@example.invalid", password=password)
+              admin.groups.set([admin_group])
+              client.force_login(admin)
+              product = Product.objects.create(name="Smoke Product", price=10, category="Indoor")
+              tag = Tag.objects.create(name="Smoke Tag")
+              product.tags.add(tag)
+              for name in ("home", "products"):
+                  assert client.get(reverse(name)).status_code == 200, name
+              for name in ("customer", "create_order"):
+                  assert client.get(reverse(name, args=[customer.pk])).status_code == 200, name
+              created = client.post(reverse("create_order", args=[customer.pk]), {
+                  "order_set-TOTAL_FORMS": "1", "order_set-INITIAL_FORMS": "0",
+                  "order_set-MIN_NUM_FORMS": "0", "order_set-MAX_NUM_FORMS": "1000",
+                  "order_set-0-product": str(product.pk), "order_set-0-status": "Pending",
+              })
+              assert created.status_code == 302, created.content
+              order = Order.objects.get(customer=customer, product=product)
+              response = client.post(reverse("update_order", args=[order.pk]), {
+                  "customer": str(customer.pk), "product": str(product.pk),
+                  "status": "Delivered", "note": "CI delivered",
+              })
+              assert response.status_code == 302, response.content
+              order.refresh_from_db()
+              assert order.status == "Delivered"
+              assert OrderFilter({"note": "delivered"}, queryset=Order.objects.all()).qs.get() == order
+              assert client.get(reverse("customer", args=[customer.pk]), {"note": "delivered"}).status_code == 200
+              assert client.get(reverse("delete_order", args=[order.pk])).status_code == 200
+              assert client.post(reverse("delete_order", args=[order.pk])).status_code == 302
+              assert not Order.objects.filter(pk=order.pk).exists()
+              Image.open(customer.profile_pic.path).verify()
+              customer.profile_pic.delete(save=False)
+          print("Authentication, role gates, password-reset mail, profile/Pillow, dashboard, products/tags, order CRUD and filters passed")
+          PY
